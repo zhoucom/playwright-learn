@@ -101,8 +101,11 @@ Sub ExportDocumentData(doc As NotesDocument, form As String)
     csvLine = EncloseQuotes(doc.UniversalID) & "," & EncloseQuotes(Cstr(doc.Created))
     
     ' Iterate all items (including system fields starting with $)
-    Forall i In doc.Items
-        Set item = i
+    Dim allItems As Variant
+    allItems = doc.Items
+    Dim iLoop As Long
+    For iLoop = 0 To Ubound(allItems)
+        Set item = allItems(iLoop)
         itmName = item.Name
         
         ' 1. Logic for RichText
@@ -130,7 +133,7 @@ Sub ExportDocumentData(doc As NotesDocument, form As String)
         End If
         
         csvLine = csvLine & "," & EncloseQuotes(itmValue)
-    End Forall
+    Next
     
     ' 4. HANDLING ATTACHMENTS (The Missing Piece)
     attachments = HandleAttachments(doc, form)
@@ -157,33 +160,44 @@ Function HandleAttachments(doc As NotesDocument, form As String) As String
     
     ' Check for all attachments (V2 and RichText embedded)
     If doc.HasEmbedded Then
-        Forall o In doc.EmbeddedObjects
-            Set obj = o
+        Dim embObjs As Variant
+        embObjs = doc.EmbeddedObjects
+        Dim oIdx As Integer
+        For oIdx = 0 To Ubound(embObjs)
+            Set obj = embObjs(oIdx)
             If obj.Type = EMBED_ATTACHMENT Then
                 path = subDir & obj.Source
                 Call obj.ExtractFile(path)
                 outPaths = outPaths & obj.Source & " (" & path & "); "
             End If
-        End Forall
+        Next
     End If
     
-    ' RichText specific check (Sometimes EmbeddedObjects list is empty but RT has them)
-    Forall i In doc.Items
-        If i.Type = RICHTEXT Then
+    ' RichText specific check
+    Dim docItems As Variant
+    docItems = doc.Items
+    Dim itmIdx As Integer
+    For itmIdx = 0 To Ubound(docItems)
+        Dim currentItm As NotesItem
+        Set currentItm = docItems(itmIdx)
+        If currentItm.Type = RICHTEXT Then
             Dim rt As Variant
-            Set rt = i
-            If Not IsEmpty(rt.EmbeddedObjects) Then
-                Forall o In rt.EmbeddedObjects
-                    Set obj = o
+            Set rt = currentItm
+            Dim rtObjs As Variant
+            rtObjs = rt.EmbeddedObjects
+            If Not IsEmpty(rtObjs) Then
+                Dim objIdx As Integer
+                For objIdx = 0 To Ubound(rtObjs)
+                    Set obj = rtObjs(objIdx)
                     If obj.Type = EMBED_ATTACHMENT Then
                         path = subDir & obj.Source
                         Call obj.ExtractFile(path)
                         outPaths = outPaths & obj.Source & " (" & path & "); "
                     End If
-                End Forall
+                Next
             End If
         End If
-    End Forall
+    Next
     
     HandleAttachments = outPaths
 End Function
