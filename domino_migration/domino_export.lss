@@ -15,6 +15,7 @@ Const EXPORT_BASE_DIR = "C:\temp\domino_export\"
 Sub Initialize
     Dim session As New NotesSession
     Dim db As NotesDatabase
+    Dim dc As NotesDocumentCollection
     Dim doc As NotesDocument
     Dim nextDoc As NotesDocument
     Dim formName As String
@@ -23,6 +24,7 @@ Sub Initialize
     Dim counters List As Long
     
     Set db = session.CurrentDatabase
+    Set dc = db.AllDocuments
     If EXPORT_ALL_DATA Then exportLimit = 0 Else exportLimit = 100
     
     Print "Starting Full Domino Export..."
@@ -35,12 +37,12 @@ Sub Initialize
     On Error Goto 0
     
     ' SINGLE PASS EXPORT: More efficient for huge datasets
-    Set doc = db.AllDocuments.GetFirstDocument
+    Set doc = dc.GetFirstDocument
     processedCount = 0
     
     While Not (doc Is Nothing)
         ' Reference next doc immediately for memory safety
-        Set nextDoc = db.AllDocuments.GetNextDocument(doc)
+        Set nextDoc = dc.GetNextDocument(doc)
         
         formName = doc.GetItemValue("Form")(0)
         If formName = "" Then formName = "UnknownForm"
@@ -105,10 +107,12 @@ Sub ExportDocumentData(doc As NotesDocument, form As String)
         
         ' 1. Logic for RichText
         If item.Type = RICHTEXT Then
-            ' Extract text content from RichText
-            itmValue = "[RTF] " & CleanupText(doc.GetItemValueCustom(itmName, "Plaintext")(0))
-            ' Note: GetItemValueCustom is R6+, for R5 use a helper or Abstract
-            If itmValue = "[RTF] " Then itmValue = "[RTF] " & Left(doc.GetItemValue(itmName)(0), 2000)
+            ' Extract text content from RichText (R5 compatible via Abstract)
+            On Error Resume Next
+            itmValue = doc.Abstract(2000, False, False, itmName)
+            If Err <> 0 Then itmValue = "[RichText Content]"
+            On Error Goto 0
+            itmValue = "[RTF] " & R5CleanupText(itmValue)
         
         ' 2. Skip binary/system objects that aren't text-convertible
         Elseif itmName = "$File" Or itmName = "$Fonts" Or itmName = "$Revisions" Then
@@ -119,7 +123,7 @@ Sub ExportDocumentData(doc As NotesDocument, form As String)
             Dim v As Variant
             v = item.Values
             If Isarray(v) Then
-                itmValue = Implode(v, "; ")
+                itmValue = R5Implode(v, "; ")
             Else
                 itmValue = Cstr(v)
             End If
@@ -189,13 +193,13 @@ Function EncloseQuotes(txt As String) As String
     Dim tmp As String
     tmp = txt
     ' Double up internal quotes
-    tmp = Substitute(tmp, """", """""")
+    tmp = R5Substitute(tmp, """", """""")
     ' Wrap in quotes
     EncloseQuotes = """" & tmp & """"
 End Function
 
 ' --------------------------------------------------------------------------------
-Function Substitute(sSource As String, sSearch As String, sReplace As String) As String
+Function R5Substitute(sSource As String, sSearch As String, sReplace As String) As String
     Dim sResult As String
     Dim nPos As Long
     sResult = sSource
@@ -204,11 +208,11 @@ Function Substitute(sSource As String, sSearch As String, sReplace As String) As
         sResult = Left(sResult, nPos - 1) & sReplace & Mid(sResult, nPos + Len(sSearch))
         nPos = Instr(nPos + Len(sReplace), sResult, sSearch)
     Wend
-    Substitute = sResult
+    R5Substitute = sResult
 End Function
 
 ' --------------------------------------------------------------------------------
-Function Implode(vArray As Variant, separator As String) As String
+Function R5Implode(vArray As Variant, separator As String) As String
     Dim s As String
     Dim i As Long
     s = ""
@@ -216,14 +220,14 @@ Function Implode(vArray As Variant, separator As String) As String
         s = s & Cstr(vArray(i))
         If i < Ubound(vArray) Then s = s & separator
     Next
-    Implode = s
+    R5Implode = s
 End Function
 
 ' --------------------------------------------------------------------------------
-Function CleanupText(txt As String) As String
+Function R5CleanupText(txt As String) As String
     ' Remove newlines/tabs to keep CSV clean
     Dim s As String
-    s = Substitute(txt, Chr(10), " ")
-    s = Substitute(s, Chr(13), " ")
-    CleanupText = Substitute(s, Chr(9), " ")
+    s = R5Substitute(txt, Chr(10), " ")
+    s = R5Substitute(s, Chr(13), " ")
+    R5CleanupText = R5Substitute(s, Chr(9), " ")
 End Function
