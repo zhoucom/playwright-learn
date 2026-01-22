@@ -1,0 +1,229 @@
+' ********************************************************************************
+' Domino Full Data Export Agent (Refined)
+' Target: Domino R5+ Compatibility
+' Features: CSV Export, RichText Extraction, Full Attachment Detaching, Efficiency
+' ********************************************************************************
+
+Option Public
+Option Explicit
+
+' --- CONFIGURATION ---
+Const EXPORT_ALL_DATA = True ' False to limit to 100 docs per form
+Const EXPORT_BASE_DIR = "C:\temp\domino_export\"
+' ********************************************************************************
+
+Sub Initialize
+    Dim session As New NotesSession
+    Dim db As NotesDatabase
+    Dim doc As NotesDocument
+    Dim nextDoc As NotesDocument
+    Dim formName As String
+    Dim processedCount As Long
+    Dim exportLimit As Long
+    Dim counters List As Long
+    
+    Set db = session.CurrentDatabase
+    If EXPORT_ALL_DATA Then exportLimit = 0 Else exportLimit = 100
+    
+    Print "Starting Full Domino Export..."
+    
+    ' Ensure base directories exist
+    On Error Resume Next
+    Mkdir "C:\temp"
+    Mkdir EXPORT_BASE_DIR
+    Mkdir EXPORT_BASE_DIR & "Attachments"
+    On Error Goto 0
+    
+    ' SINGLE PASS EXPORT: More efficient for huge datasets
+    Set doc = db.AllDocuments.GetFirstDocument
+    processedCount = 0
+    
+    While Not (doc Is Nothing)
+        ' Reference next doc immediately for memory safety
+        Set nextDoc = db.AllDocuments.GetNextDocument(doc)
+        
+        formName = doc.GetItemValue("Form")(0)
+        If formName = "" Then formName = "UnknownForm"
+        
+        ' Filter logic
+        Dim skip As Integer
+        skip = False
+        If exportLimit > 0 Then
+            If IsElement(counters(formName)) Then
+                If counters(formName) >= exportLimit Then skip = True
+            End If
+        End If
+        
+        If Not skip Then
+            ' Update counters
+            If IsElement(counters(formName)) Then
+                counters(formName) = counters(formName) + 1
+            Else
+                counters(formName) = 1
+            End If
+            
+            ' CORE EXPORT LOGIC
+            Call ExportDocumentData(doc, formName)
+            
+            processedCount = processedCount + 1
+            If processedCount Mod 100 = 0 Then
+                Print "Processed " & processedCount & " documents..."
+            End If
+        End If
+        
+        ' Explicit memory cleanup (CRITICAL for large NSF)
+        Set doc = Nothing
+        Set doc = nextDoc
+    Wend
+    
+    Msgbox "Export Finished! Total: " & processedCount & " documents." & Chr(10) & "Location: " & EXPORT_BASE_DIR
+End Sub
+
+' --------------------------------------------------------------------------------
+Sub ExportDocumentData(doc As NotesDocument, form As String)
+    Dim fileNum As Integer
+    Dim csvPath As String
+    Dim csvLine As String
+    Dim item As NotesItem
+    Dim itmName As String
+    Dim itmValue As String
+    Dim attachments As String
+    
+    csvPath = EXPORT_BASE_DIR & "data_" & form & ".csv"
+    fileNum = FreeFile
+    
+    ' Open for Append (Ensures data is saved even if crash happens)
+    Open csvPath For Append Access Write As #fileNum
+    
+    ' Standard Header Info (UNID, Created)
+    csvLine = EncloseQuotes(doc.UniversalID) & "," & EncloseQuotes(Cstr(doc.Created))
+    
+    ' Iterate all items (including system fields starting with $)
+    Forall i In doc.Items
+        Set item = i
+        itmName = item.Name
+        
+        ' 1. Logic for RichText
+        If item.Type = RICHTEXT Then
+            ' Extract text content from RichText
+            itmValue = "[RTF] " & CleanupText(doc.GetItemValueCustom(itmName, "Plaintext")(0))
+            ' Note: GetItemValueCustom is R6+, for R5 use a helper or Abstract
+            If itmValue = "[RTF] " Then itmValue = "[RTF] " & Left(doc.GetItemValue(itmName)(0), 2000)
+        
+        ' 2. Skip binary/system objects that aren't text-convertible
+        Elseif itmName = "$File" Or itmName = "$Fonts" Or itmName = "$Revisions" Then
+            itmValue = "[SYSTEM FIELD: " & itmName & "]"
+            
+        ' 3. Standard Field
+        Else
+            Dim v As Variant
+            v = item.Values
+            If Isarray(v) Then
+                itmValue = Implode(v, "; ")
+            Else
+                itmValue = Cstr(v)
+            End If
+        End If
+        
+        csvLine = csvLine & "," & EncloseQuotes(itmValue)
+    End Forall
+    
+    ' 4. HANDLING ATTACHMENTS (The Missing Piece)
+    attachments = HandleAttachments(doc, form)
+    csvLine = csvLine & "," & EncloseQuotes(attachments)
+    
+    Print #fileNum, csvLine
+    Close #fileNum
+End Sub
+
+' --------------------------------------------------------------------------------
+Function HandleAttachments(doc As NotesDocument, form As String) As String
+    Dim obj As NotesEmbeddedObject
+    Dim path As String
+    Dim outPaths As String
+    Dim subDir As String
+    
+    outPaths = ""
+    subDir = EXPORT_BASE_DIR & "Attachments\" & form & "\" & doc.UniversalID & "\"
+    
+    On Error Resume Next
+    Mkdir EXPORT_BASE_DIR & "Attachments\" & form
+    Mkdir subDir
+    On Error Goto 0
+    
+    ' Check for all attachments (V2 and RichText embedded)
+    If doc.HasEmbedded Then
+        Forall o In doc.EmbeddedObjects
+            Set obj = o
+            If obj.Type = EMBED_ATTACHMENT Then
+                path = subDir & obj.Source
+                Call obj.ExtractFile(path)
+                outPaths = outPaths & obj.Source & " (" & path & "); "
+            End If
+        End Forall
+    End If
+    
+    ' RichText specific check (Sometimes EmbeddedObjects list is empty but RT has them)
+    Forall i In doc.Items
+        If i.Type = RICHTEXT Then
+            Dim rt As Variant
+            Set rt = i
+            If Not IsEmpty(rt.EmbeddedObjects) Then
+                Forall o In rt.EmbeddedObjects
+                    Set obj = o
+                    If obj.Type = EMBED_ATTACHMENT Then
+                        path = subDir & obj.Source
+                        Call obj.ExtractFile(path)
+                        outPaths = outPaths & obj.Source & " (" & path & "); "
+                    End If
+                End Forall
+            End If
+        End If
+    End Forall
+    
+    HandleAttachments = outPaths
+End Function
+
+' --------------------------------------------------------------------------------
+Function EncloseQuotes(txt As String) As String
+    Dim tmp As String
+    tmp = txt
+    ' Double up internal quotes
+    tmp = Substitute(tmp, """", """""")
+    ' Wrap in quotes
+    EncloseQuotes = """" & tmp & """"
+End Function
+
+' --------------------------------------------------------------------------------
+Function Substitute(sSource As String, sSearch As String, sReplace As String) As String
+    Dim sResult As String
+    Dim nPos As Long
+    sResult = sSource
+    nPos = Instr(sResult, sSearch)
+    While nPos > 0
+        sResult = Left(sResult, nPos - 1) & sReplace & Mid(sResult, nPos + Len(sSearch))
+        nPos = Instr(nPos + Len(sReplace), sResult, sSearch)
+    Wend
+    Substitute = sResult
+End Function
+
+' --------------------------------------------------------------------------------
+Function Implode(vArray As Variant, separator As String) As String
+    Dim s As String
+    Dim i As Long
+    s = ""
+    For i = Lbound(vArray) To Ubound(vArray)
+        s = s & Cstr(vArray(i))
+        If i < Ubound(vArray) Then s = s & separator
+    Next
+    Implode = s
+End Function
+
+' --------------------------------------------------------------------------------
+Function CleanupText(txt As String) As String
+    ' Remove newlines/tabs to keep CSV clean
+    Dim s As String
+    s = Substitute(txt, Chr(10), " ")
+    s = Substitute(s, Chr(13), " ")
+    CleanupText = Substitute(s, Chr(9), " ")
+End Function
