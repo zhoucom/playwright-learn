@@ -1,149 +1,295 @@
 ' ********************************************************************************
-' Domino Full Data Export Agent (Refined)
+' Domino Full Data Export Agent (Two-Pass for Perfect Schema)
 ' Target: Domino R5+ Compatibility
-' Features: CSV Export, RichText Extraction, Full Attachment Detaching, Efficiency
+' Features: 
+'  - Two-Pass: 1. Scan for Schema (Union of Fields), 2. Export Data
+'  - Guarantees 100% Header Accuracy & Column Alignment
+'  - Handles RichText & Attachments
 ' ********************************************************************************
 
 Option Public
 Option Explicit
 
 ' --- CONFIGURATION ---
-Const EXPORT_ALL_DATA = True ' False to limit to 100 docs per form
+Const EXPORT_ALL_DATA = True ' False to limit to 100 docs per form (for testing)
 Const EXPORT_BASE_DIR = "C:\temp\domino_export\"
 ' ********************************************************************************
+
+' Global Schema Storage: List of Strings (Form -> "Field1,Field2,Field3")
+Dim g_Schemas List As String 
+' Global Counters for limits
+Dim g_Counters List As Long
 
 Sub Initialize
     Dim session As New NotesSession
     Dim db As NotesDatabase
+    
+    Set db = session.CurrentDatabase
+    
+    Print "PHASE 1: Scanning Schema (Building Headers)..."
+    Call BuildSchemas(db)
+    
+    Print "PHASE 2: Write Headers & Export Data..."
+    Call ExportData(db)
+    
+    Msgbox "Two-Pass Export Finished!" & Chr(10) & "Location: " & EXPORT_BASE_DIR
+End Sub
+
+' ********************************************************************************
+' PHASE 1: Build Schemas (The Discovery Pass)
+' ********************************************************************************
+Sub BuildSchemas(db As NotesDatabase)
     Dim dc As NotesDocumentCollection
     Dim doc As NotesDocument
     Dim nextDoc As NotesDocument
     Dim formName As String
-    Dim processedCount As Long
-    Dim exportLimit As Long
-    Dim counters List As Long
+    Dim items As Variant
+    Dim i As Integer
+    Dim fieldList As String
+    Dim fieldArray() As String
+    Dim existingFields As String
+    Dim processed As Long
     
-    Set db = session.CurrentDatabase
     Set dc = db.AllDocuments
-    If EXPORT_ALL_DATA Then exportLimit = 0 Else exportLimit = 100
+    Set doc = dc.GetFirstDocument
+    processed = 0
     
-    Print "Starting Full Domino Export..."
+    ' Reset global counters for schema pass
+    Erase g_Counters
     
-    ' Ensure base directories exist
+    While Not (doc Is Nothing)
+        Set nextDoc = dc.GetNextDocument(doc)
+        
+        formName = doc.GetItemValue("Form")(0)
+        If formName = "" Then formName = "UnknownForm"
+        
+        ' Filter Logic (Respect limits for schema building too, 
+        ' so we build schema only for what we export)
+        Dim skip As Integer
+        skip = False
+        
+        If Not EXPORT_ALL_DATA Then
+            If IsElement(g_Counters(formName)) Then
+                If g_Counters(formName) >= 100 Then skip = True
+            End If
+        End If
+        
+        If Not skip Then
+            ' Increment counter
+            If IsElement(g_Counters(formName)) Then
+                g_Counters(formName) = g_Counters(formName) + 1
+            Else
+                g_Counters(formName) = 1
+            End If
+            
+            ' Add Doc Fields to Schema Union
+            If IsElement(g_Schemas(formName)) Then
+                existingFields = g_Schemas(formName)
+            Else
+                existingFields = "UNID|Created|Attachments" ' Base Fields
+            End If
+            
+            ' Safe Item Iteration
+            items = doc.Items
+            If IsArray(items) Then
+                For i = 0 To Ubound(items)
+                    If Not (items(i) Is Nothing) Then
+                        Dim iName As String
+                        iName = items(i).Name
+                        ' Filter standard system fields if needed, or keep all
+                        ' Only add if not already in list (Simple check)
+                        If Instr(1, "|" & existingFields & "|", "|" & iName & "|", 5) = 0 Then
+                           existingFields = existingFields & "|" & iName
+                        End If
+                    End If
+                Next
+            End If
+            
+            g_Schemas(formName) = existingFields
+            
+            processed = processed + 1
+            If processed Mod 500 = 0 Then Print "Scanning Schema: " & processed & " docs..."
+        End If
+        
+        Set doc = Nothing
+        Set doc = nextDoc
+    Wend
+    
+    ' Finalize Schemas: Convert pipe-delimited to Sorted CSV keys if possible
+    ' For R5, strict sorting is hard, but we have a fixed string now.
+    Print "Schema Scan Complete. Found " & processed & " valid docs."
+End Sub
+
+' ********************************************************************************
+' PHASE 2: Export Data (The Write Pass)
+' ********************************************************************************
+Sub ExportData(db As NotesDatabase)
+    Dim dc As NotesDocumentCollection
+    Dim doc As NotesDocument
+    Dim nextDoc As NotesDocument
+    Dim formName As String
+    Dim processed As Long
+    
+    ' Write Headers First
+    Dim fName As String
+    Forall s In g_Schemas
+        fName = Listtag(s)
+        Call WriteHeader(fName, s)
+    End Forall
+    
+    Set dc = db.AllDocuments
+    Set doc = dc.GetFirstDocument
+    processed = 0
+    
+    ' Reset counters for export pass
+    Erase g_Counters
+    
+    ' Ensure base dirs (idempotent)
     On Error Resume Next
     Mkdir "C:\temp"
     Mkdir EXPORT_BASE_DIR
     Mkdir EXPORT_BASE_DIR & "Attachments"
     On Error Goto 0
     
-    ' SINGLE PASS EXPORT: More efficient for huge datasets
-    Set doc = dc.GetFirstDocument
-    processedCount = 0
-    
     While Not (doc Is Nothing)
-        ' Reference next doc immediately for memory safety
         Set nextDoc = dc.GetNextDocument(doc)
         
         formName = doc.GetItemValue("Form")(0)
         If formName = "" Then formName = "UnknownForm"
         
-        ' Filter logic
+        ' Exact same filter logic as Pass 1
         Dim skip As Integer
         skip = False
-        If exportLimit > 0 Then
-            If IsElement(counters(formName)) Then
-                If counters(formName) >= exportLimit Then skip = True
+        
+        If Not EXPORT_ALL_DATA Then
+            If IsElement(g_Counters(formName)) Then
+                If g_Counters(formName) >= 100 Then skip = True
             End If
         End If
         
         If Not skip Then
-            ' Update counters
-            If IsElement(counters(formName)) Then
-                counters(formName) = counters(formName) + 1
+            If IsElement(g_Counters(formName)) Then
+                g_Counters(formName) = g_Counters(formName) + 1
             Else
-                counters(formName) = 1
+                g_Counters(formName) = 1
             End If
             
-            ' CORE EXPORT LOGIC
-            Call ExportDocumentData(doc, formName)
+            ' EXPORT ROW
+            Call ExportRow(doc, formName)
             
-            processedCount = processedCount + 1
-            If processedCount Mod 100 = 0 Then
-                Print "Processed " & processedCount & " documents..."
-            End If
+            processed = processed + 1
+            If processed Mod 100 = 0 Then Print "Exporting Data: " & processed & " docs..."
         End If
         
-        ' Explicit memory cleanup (CRITICAL for large NSF)
         Set doc = Nothing
         Set doc = nextDoc
     Wend
-    
-    Msgbox "Export Finished! Total: " & processedCount & " documents." & Chr(10) & "Location: " & EXPORT_BASE_DIR
 End Sub
 
-' --------------------------------------------------------------------------------
-Sub ExportDocumentData(doc As NotesDocument, form As String)
+Sub WriteHeader(form As String, schemaStr As String)
     Dim fileNum As Integer
     Dim csvPath As String
+    Dim headers As Variant
     Dim csvLine As String
-    Dim item As NotesItem
-    Dim itmName As String
-    Dim itmValue As String
-    Dim attachments As String
+    Dim i As Integer
     
     csvPath = EXPORT_BASE_DIR & "data_" & form & ".csv"
     fileNum = FreeFile
     
-    ' Open for Append (Ensures data is saved even if crash happens)
-    Open csvPath For Append Access Write As #fileNum
+    ' Overwrite file for header
+    Open csvPath For Output As #fileNum
     
-    ' Standard Header Info (UNID, Created)
-    csvLine = EncloseQuotes(doc.UniversalID) & "," & EncloseQuotes(Cstr(doc.Created))
+    ' Simple split by pipe
+    headers = Explode(schemaStr, "|")
+    csvLine = ""
     
-    ' Iterate all items (including system fields starting with $)
-    Dim allItems As Variant
-    allItems = doc.Items
-    Dim iLoop As Long
-    For iLoop = 0 To Ubound(allItems)
-        Set item = allItems(iLoop)
-        itmName = item.Name
-        
-        ' 1. Logic for RichText
-        If item.Type = RICHTEXT Then
-            ' Extract text content from RichText (R5 compatible via Abstract)
-            On Error Resume Next
-            itmValue = doc.Abstract(2000, False, False, itmName)
-            If Err <> 0 Then itmValue = "[RichText Content]"
-            On Error Goto 0
-            itmValue = "[RTF] " & R5CleanupText(itmValue)
-        
-        ' 2. Skip binary/system objects that aren't text-convertible
-        Elseif itmName = "$File" Or itmName = "$Fonts" Or itmName = "$Revisions" Then
-            itmValue = "[SYSTEM FIELD: " & itmName & "]"
-            
-        ' 3. Standard Field
-        Else
-            Dim v As Variant
-            v = item.Values
-            If Isarray(v) Then
-                itmValue = R5Implode(v, "; ")
-            Else
-                itmValue = Cstr(v)
-            End If
-        End If
-        
-        csvLine = csvLine & "," & EncloseQuotes(itmValue)
+    For i = 0 To Ubound(headers)
+        If i > 0 Then csvLine = csvLine & ","
+        csvLine = csvLine & EncloseQuotes(Cstr(headers(i)))
     Next
-    
-    ' 4. HANDLING ATTACHMENTS (The Missing Piece)
-    attachments = HandleAttachments(doc, form)
-    csvLine = csvLine & "," & EncloseQuotes(attachments)
     
     Print #fileNum, csvLine
     Close #fileNum
 End Sub
 
+Sub ExportRow(doc As NotesDocument, form As String)
+    Dim fileNum As Integer
+    Dim csvPath As String
+    Dim schemaStr As String
+    Dim fields As Variant
+    Dim csvLine As String
+    Dim i As Integer
+    Dim fName As String
+    Dim valStr As String
+    Dim item As NotesItem
+    
+    If Not IsElement(g_Schemas(form)) Then Exit Sub
+    schemaStr = g_Schemas(form)
+    
+    csvPath = EXPORT_BASE_DIR & "data_" & form & ".csv"
+    fileNum = FreeFile
+    
+    ' Append Data
+    Open csvPath For Append As #fileNum
+    
+    fields = Explode(schemaStr, "|")
+    csvLine = ""
+    
+    For i = 0 To Ubound(fields)
+        fName = Cstr(fields(i))
+        valStr = ""
+        
+        ' Special Fields
+        If fName = "UNID" Then
+            valStr = doc.UniversalID
+        Elseif fName = "Created" Then
+            valStr = Cstr(doc.Created)
+        Elseif fName = "Attachments" Then
+            valStr = HandleAttachments(doc, form)
+        Else
+            ' Lookup Item safely
+            Set item = doc.GetFirstItem(fName)
+            If Not (item Is Nothing) Then
+               valStr = GetItemValueStr(doc, item) 
+            End If
+        End If
+        
+        If i > 0 Then csvLine = csvLine & ","
+        csvLine = csvLine & EncloseQuotes(valStr)
+    Next
+    
+    Print #fileNum, csvLine
+    Close #fileNum
+End Sub
+
+Function GetItemValueStr(doc As NotesDocument, item As NotesItem) As String
+    Dim valStr As String
+    
+    If item.Type = RICHTEXT Then
+        On Error Resume Next
+        valStr = doc.Abstract(2000, False, False, item.Name)
+        If Err <> 0 Then valStr = "[Complex RTF]"
+        On Error Goto 0
+        valStr = "[RTF] " & R5CleanupText(valStr)
+    Else
+        Dim v As Variant
+        v = item.Values
+        If IsArray(v) Then
+            valStr = R5Implode(v, "; ")
+        Else
+            valStr = Cstr(v)
+        End If
+        valStr = R5CleanupText(valStr)
+    End If
+    
+    GetItemValueStr = valStr
+End Function
+
+
 ' --------------------------------------------------------------------------------
+' HELPER FUNCTIONS
+' --------------------------------------------------------------------------------
+
 Function HandleAttachments(doc As NotesDocument, form As String) As String
     Dim obj As NotesEmbeddedObject
     Dim path As String
@@ -175,34 +321,37 @@ Function HandleAttachments(doc As NotesDocument, form As String) As String
     
     ' RichText specific check
     Dim docItems As Variant
-    docItems = doc.Items
-    Dim itmIdx As Integer
-    For itmIdx = 0 To Ubound(docItems)
-        Dim currentItm As NotesItem
-        Set currentItm = docItems(itmIdx)
-        If currentItm.Type = RICHTEXT Then
-            Dim rt As Variant
-            Set rt = currentItm
-            Dim rtObjs As Variant
-            rtObjs = rt.EmbeddedObjects
-            If Not IsEmpty(rtObjs) Then
-                Dim objIdx As Integer
-                For objIdx = 0 To Ubound(rtObjs)
-                    Set obj = rtObjs(objIdx)
-                    If obj.Type = EMBED_ATTACHMENT Then
-                        path = subDir & obj.Source
-                        Call obj.ExtractFile(path)
-                        outPaths = outPaths & obj.Source & " (" & path & "); "
+    If IsArray(doc.Items) Then
+        docItems = doc.Items
+        Dim itmIdx As Integer
+        For itmIdx = 0 To Ubound(docItems)
+            Dim currentItm As NotesItem
+            If Not (docItems(itmIdx) Is Nothing) Then
+                Set currentItm = docItems(itmIdx)
+                If currentItm.Type = RICHTEXT Then
+                    Dim rt As Variant
+                    Set rt = currentItm
+                    Dim rtObjs As Variant
+                    rtObjs = rt.EmbeddedObjects
+                    If Not IsEmpty(rtObjs) Then
+                        Dim objIdx As Integer
+                        For objIdx = 0 To Ubound(rtObjs)
+                            Set obj = rtObjs(objIdx)
+                            If obj.Type = EMBED_ATTACHMENT Then
+                                path = subDir & obj.Source
+                                Call obj.ExtractFile(path)
+                                outPaths = outPaths & obj.Source & " (" & path & "); "
+                            End If
+                        Next
                     End If
-                Next
+                End If
             End If
-        End If
-    Next
+        Next
+    End If
     
     HandleAttachments = outPaths
 End Function
 
-' --------------------------------------------------------------------------------
 Function EncloseQuotes(txt As String) As String
     Dim tmp As String
     tmp = txt
@@ -212,7 +361,6 @@ Function EncloseQuotes(txt As String) As String
     EncloseQuotes = """" & tmp & """"
 End Function
 
-' --------------------------------------------------------------------------------
 Function R5Substitute(sSource As String, sSearch As String, sReplace As String) As String
     Dim sResult As String
     Dim nPos As Long
@@ -225,7 +373,6 @@ Function R5Substitute(sSource As String, sSearch As String, sReplace As String) 
     R5Substitute = sResult
 End Function
 
-' --------------------------------------------------------------------------------
 Function R5Implode(vArray As Variant, separator As String) As String
     Dim s As String
     Dim i As Long
@@ -237,11 +384,31 @@ Function R5Implode(vArray As Variant, separator As String) As String
     R5Implode = s
 End Function
 
-' --------------------------------------------------------------------------------
 Function R5CleanupText(txt As String) As String
-    ' Remove newlines/tabs to keep CSV clean
     Dim s As String
     s = R5Substitute(txt, Chr(10), " ")
     s = R5Substitute(s, Chr(13), " ")
     R5CleanupText = R5Substitute(s, Chr(9), " ")
+End Function
+
+Function Explode(Byval s As String, separator As String) As Variant
+    ' Custom Split function for R5
+    Dim result() As String
+    Dim n As Integer
+    Dim p As Long
+    
+    n = 0
+    p = Instr(s, separator)
+    While p > 0
+        Redim Preserve result(n)
+        result(n) = Left(s, p - 1)
+        s = Mid(s, p + Len(separator))
+        n = n + 1
+        p = Instr(s, separator)
+    Wend
+    
+    Redim Preserve result(n)
+    result(n) = s
+    
+    Explode = result
 End Function
