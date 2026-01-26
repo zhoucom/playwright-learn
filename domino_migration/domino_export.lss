@@ -11,7 +11,7 @@ Option Public
 Option Explicit
 
 ' --- CONFIGURATION ---
-Const EXPORT_ALL_DATA = False    ' False to limit to SAMPLE_LIMIT docs per form 
+Const EXPORT_ALL_DATA = True    ' False to limit to SAMPLE_LIMIT docs per form 
 Const SAMPLE_LIMIT = 10         ' Number of docs to scan AND export in test mode
 Const FULL_MODE_SCAN_LIMIT = 50 ' Only used when EXPORT_ALL_DATA=True (0 for perfect accuracy)
 Const SKIP_ATTACHMENTS = True   ' Set to True to skip attachment extraction for speed
@@ -25,6 +25,8 @@ Sub Initialize
     Dim session As New NotesSession
     Dim db As NotesDatabase
     Dim processedForms List As Integer
+    Dim orphanQuery As String
+    Dim formCount As Integer
     
     Set db = session.CurrentDatabase
     
@@ -37,27 +39,32 @@ Sub Initialize
     
     Print "PHASE 1: Exporting Known Forms..."
     
+    orphanQuery = ""
+    formCount = 0
     ' Iterate through all forms in the database
     Forall formObj In db.Forms
-        processedForms(formObj.Name) = 1
-        Call ProcessForm(db, formObj.Name)
+        Dim fName As String
+        fName = formObj.Name
+        If fName <> "" Then
+            processedForms(fName) = 1
+            Call ProcessForm(db, fName)
+            
+            ' Build orphan query carefully (Domino query length limit is approx 512-1024 chars in Search)
+            If Len(orphanQuery) < 800 Then 
+                If orphanQuery <> "" Then orphanQuery = orphanQuery & " & "
+                orphanQuery = orphanQuery & "Form != """ & fName & """"
+            End If
+            formCount = formCount + 1
+        End If
     End Forall
     
-    Print "PHASE 2: Checking for Orphaned Data (No Form or Unknown Form)..."
-    ' Create a query to find documents not using design forms
-    Dim orphanQuery As String
-    orphanQuery = ""
-    Forall f In processedForms
-        If orphanQuery <> "" Then orphanQuery = orphanQuery & " & "
-        orphanQuery = orphanQuery & "Form != """ & Listtag(f) & """"
-    End Forall
+    Print "PHASE 2: Checking for Orphaned Data..."
+    ' If the database has documents with NO Form field, orphanQuery will catch them too
+    If orphanQuery = "" Then orphanQuery = "@All" ' Should not happen if forms exist
     
-    ' Process leftovers as "UnknownData"
-    If orphanQuery <> "" Then
-        Call ProcessOrphanedDocs(db, orphanQuery)
-    End If
+    Call ProcessOrphanedDocs(db, orphanQuery)
     
-    Msgbox "Optimized Export Finished!" & Chr(10) & "Location: " & EXPORT_BASE_DIR
+    Msgbox "Export Finished! Checked " & formCount & " forms." & Chr(10) & "Location: " & EXPORT_BASE_DIR
 End Sub
 
 ' ********************************************************************************
@@ -80,15 +87,22 @@ Sub ProcessForm(db As NotesDatabase, formName As String)
         scanLimit = SAMPLE_LIMIT
     End If
     
-    query = "Form = """ & formName & """"
+    ' Use @LowerCase for query to handle case-mismatch in R5/R6
+    query = "@LowerCase(Form) = """ & Lcase(formName) & """"
     Set dc = db.Search(query, Nothing, scanLimit) 
+    
+    ' Fallback to simple query if complex one returns 0 (LotusScript quirks)
+    If dc.Count = 0 Then
+        query = "Form = """ & formName & """"
+        Set dc = db.Search(query, Nothing, scanLimit)
+    End If
+    
     If dc.Count = 0 Then Exit Sub 
     
     Print "Processing Form: " & formName & " (Scanning Schema...)"
     schemaStr = "UNID|Created|Attachments"
     Set doc = dc.GetFirstDocument
     While Not (doc Is Nothing)
-        ' Add Doc Fields to Schema Union
         Call UpdateSchema(doc, schemaStr)
         Set doc = dc.GetNextDocument(doc)
     Wend
@@ -102,10 +116,11 @@ Sub ProcessForm(db As NotesDatabase, formName As String)
     
     ' 3. EXPORT DATA
     Print "Processing Form: " & formName & " (Exporting Data...)"
+    ' Re-execute search without document limit if EXPORT_ALL_DATA
     If EXPORT_ALL_DATA Then
         Set dc = db.Search(query, Nothing, 0)
     Else
-        Set dc = db.Search(query, Nothing, SAMPLE_LIMIT)
+        ' In sample mode, we already have the collection from Build Schema step
     End If
     
     count = 0
@@ -129,16 +144,17 @@ Sub ProcessOrphanedDocs(db As NotesDatabase, query As String)
     Dim csvPath As String
     Dim count As Long
     
-    ' 1. BUILD SCHEMA
+    ' 1. BUILD SCHEMA (Use a separate scan of first few docs)
     Dim scanLimit As Integer
     If EXPORT_ALL_DATA Then
         scanLimit = FULL_MODE_SCAN_LIMIT
-        If scanLimit = 0 Then scanLimit = 100 ' Fallback for orphaned scan if not specified
+        If scanLimit = 0 Then scanLimit = 50 
     Else
         scanLimit = SAMPLE_LIMIT
     End If
     
-    Set dc = db.Search(query, Nothing, 0) ' Get collection first
+    ' We use Search with 0 to get the full collection, then manually limit scan
+    Set dc = db.Search(query, Nothing, 0) 
     If dc.Count = 0 Then Exit Sub
     
     Print "Processing Orphaned Docs (Scanning Schema...)"
@@ -159,7 +175,7 @@ Sub ProcessOrphanedDocs(db As NotesDatabase, query As String)
     Print "Processing Orphaned Docs (Exporting Data...)"
     count = 0
     Set doc = dc.GetFirstDocument
-    While Not (doc Is Nothing)
+    Do While Not (doc Is Nothing)
         Call ExportRowToFile(fileNum, doc, schemaStr, "Orphaned")
         count = count + 1
         If count Mod 100 = 0 Then Print "  Orphaned: " & count & " docs..."
@@ -167,9 +183,9 @@ Sub ProcessOrphanedDocs(db As NotesDatabase, query As String)
         
         ' Respect SAMPLE_LIMIT even for orphaned docs if test mode
         If Not EXPORT_ALL_DATA Then
-            If count >= SAMPLE_LIMIT Then Exit While
+            If count >= SAMPLE_LIMIT Then Exit Do
         End If
-    Wend
+    Loop
     
     Close #fileNum
     Print "Finished Orphaned Docs (" & count & " docs exported)"
