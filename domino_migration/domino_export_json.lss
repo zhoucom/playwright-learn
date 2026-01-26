@@ -1,0 +1,219 @@
+' ********************************************************************************
+' Domino Data Export - Ultra-Fast JSONL (Schema-less Mode)
+' ********************************************************************************
+
+Option Public
+Option Explicit
+
+' --- CONFIGURATION ---
+Const EXPORT_ALL_DATA = True    ' False for testing (SAMPLE_LIMIT), True for full export
+Const SAMPLE_LIMIT = 100        ' Max docs per form in test mode
+Const SKIP_ATTACHMENTS = True   ' JSON export focus is on data, skip attachments for speed
+Const EXPORT_BASE_DIR = "C:\temp\domino_export_json\"
+' ********************************************************************************
+
+' File Handle Storage: List of Integers (Form -> FileNumber)
+Dim g_FileHandles List As Integer
+' Document Counters (Form -> Count)
+Dim g_DocCounters List As Long
+
+Sub Initialize
+    Dim session As New NotesSession
+    Dim db As NotesDatabase
+    Dim dc As NotesDocumentCollection
+    Dim doc As NotesDocument
+    Dim nextDoc As NotesDocument
+    Dim processed As Long
+    Dim startTime As Single
+    
+    Set db = session.CurrentDatabase
+    startTime = Timer
+    
+    ' Ensure base dirs 
+    On Error Resume Next
+    Mkdir "C:\temp"
+    Mkdir EXPORT_BASE_DIR
+    On Error Goto 0
+    
+    ' 1. Single Pass Export (Fastest)
+    Print "Starting Single-Pass JSON Export..."
+    
+    Set dc = db.AllDocuments
+    Set doc = dc.GetFirstDocument
+    processed = 0
+    
+    While Not (doc Is Nothing)
+        Set nextDoc = dc.GetNextDocument(doc)
+        
+        Call ProcessDocumentToJson(doc)
+        
+        processed = processed + 1
+        If processed Mod 500 = 0 Then 
+            Print "Export Progress: " & processed & " docs... (" & Format(Timer - startTime, "0.0") & "s)"
+        End If
+        
+        Set doc = Nothing
+        Set doc = nextDoc
+    Wend
+    
+    ' Cleanup
+    Call CloseAllFiles()
+    
+    Msgbox "JSON Export Finished!" & Chr(10) & _
+    "Total docs: " & processed & Chr(10) & _
+    "Time: " & Format(Timer - startTime, "0.0") & "s" & Chr(10) & _
+    "Location: " & EXPORT_BASE_DIR
+End Sub
+
+' ********************************************************************************
+' Core Document Processor (JSON Version)
+' ********************************************************************************
+Sub ProcessDocumentToJson(doc As NotesDocument)
+    Dim formName As String
+    Dim fileNum As Integer
+    Dim jsonLine As String
+    Dim item As NotesItem
+    Dim firstItem As Boolean
+    
+    formName = doc.GetItemValue("Form")(0)
+    If formName = "" Then formName = "UnknownForm"
+    
+    ' Respect sample limit if needed
+    If Not EXPORT_ALL_DATA Then
+        If Not IsElement(g_DocCounters(formName)) Then g_DocCounters(formName) = 0
+        If g_DocCounters(formName) >= SAMPLE_LIMIT Then Exit Sub
+    End If
+    
+    ' Lazy File Opening
+    If Not IsElement(g_FileHandles(formName)) Then
+        Call CreateJsonlFile(formName)
+    End If
+    
+    fileNum = g_FileHandles(formName)
+    
+    ' --- BUILID JSON STRING (Single Pass) ---
+    ' Standard Metadata
+    jsonLine = "{" & _
+    """_unid"":""" & doc.UniversalID & """," & _
+    """_created"":""" & Cstr(doc.Created) & ""","
+    
+    ' Iterate ALL items exactly once
+    firstItem = True
+    Forall i In doc.Items
+        Set item = i
+        If Not firstItem Then jsonLine = jsonLine & ","
+        
+        jsonLine = jsonLine & """" & EscapeJson(item.Name) & """:" & GetItemJsonValue(doc, item)
+        firstItem = False
+    End Forall
+    
+    jsonLine = jsonLine & "}"
+    
+    ' Write as single line (JSONL format)
+    Print #fileNum, jsonLine
+    
+    ' Increment Counter
+    If Not IsElement(g_DocCounters(formName)) Then g_DocCounters(formName) = 0
+    g_DocCounters(formName) = g_DocCounters(formName) + 1
+End Sub
+
+Sub CreateJsonlFile(form As String)
+    Dim fileNum As Integer
+    Dim filePath As String
+    Dim safeForm As String
+    
+    ' Sanitize filename
+    safeForm = R5Substitute(form, "/", "_")
+    safeForm = R5Substitute(safeForm, "\", "_")
+    
+    filePath = EXPORT_BASE_DIR & "data_" & safeForm & ".jsonl"
+    fileNum = FreeFile
+    Open filePath For Output As #fileNum
+    
+    g_FileHandles(form) = fileNum
+End Sub
+
+Function GetItemJsonValue(doc As NotesDocument, item As NotesItem) As String
+    Dim v As Variant
+    Dim i As Long
+    Dim s As String
+    
+    ' Handle RichText
+    If item.Type = 1 Then ' RICHTEXT
+        On Error Resume Next
+        s = doc.Abstract(5000, False, False, item.Name)
+        If Err <> 0 Then s = "[Complex RTF]"
+        On Error Goto 0
+        GetItemJsonValue = """" & EscapeJson(s) & """"
+        Exit Function
+    End If
+    
+    ' Handle values
+    v = item.Values
+    If IsArray(v) Then
+        If Ubound(v) < Lbound(v) Then
+            GetItemJsonValue = "null"
+        Elseif Ubound(v) = Lbound(v) Then
+            ' Single value array -> optimize if desired, or keep as array
+            GetItemJsonValue = FormatSingleValue(v(Lbound(v)))
+        Else
+            ' Real array
+            s = "["
+            For i = Lbound(v) To Ubound(v)
+                s = s & FormatSingleValue(v(i))
+                If i < Ubound(v) Then s = s & ","
+            Next
+            s = s & "]"
+            GetItemJsonValue = s
+        End If
+    Else
+        GetItemJsonValue = FormatSingleValue(v)
+    End If
+End Function
+
+Function FormatSingleValue(v As Variant) As String
+    Dim t As Integer
+    t = Datatype(v)
+    
+    Select Case t
+    Case 2, 3, 4, 5, 20: ' Numbers
+        FormatSingleValue = Cstr(v)
+    Case 11: ' Boolean (Not common in R5, but for safety)
+        If v Then FormatSingleValue = "true" Else FormatSingleValue = "false"
+    Case 7: ' Date
+        FormatSingleValue = """" & Cstr(v) & """"
+    Case Else: ' String and others
+        FormatSingleValue = """" & EscapeJson(Cstr(v)) & """"
+    End Select
+End Function
+
+Function EscapeJson(txt As String) As String
+    Dim s As String
+    s = txt
+    ' JSON Escape rules
+    s = R5Substitute(s, "\", "\\")
+    s = R5Substitute(s, """", "\""")
+    s = R5Substitute(s, Chr(10), "\n")
+    s = R5Substitute(s, Chr(13), "\r")
+    s = R5Substitute(s, Chr(9), "\t")
+    EscapeJson = s
+End Function
+
+Function R5Substitute(sSource As String, sSearch As String, sReplace As String) As String
+    Dim sResult As String
+    Dim nPos As Long
+    sResult = sSource
+    nPos = Instr(sResult, sSearch)
+    While nPos > 0
+        sResult = Left(sResult, nPos - 1) & sReplace & Mid(sResult, nPos + Len(sSearch))
+        nPos = Instr(nPos + Len(sReplace), sResult, sSearch)
+    Wend
+    R5Substitute = sResult
+End Function
+
+Sub CloseAllFiles()
+    Forall h In g_FileHandles
+        Close #h
+    End Forall
+    Erase g_FileHandles
+End Sub
