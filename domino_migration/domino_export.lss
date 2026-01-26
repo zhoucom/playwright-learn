@@ -1,214 +1,163 @@
 ' ********************************************************************************
-' Domino Full Data Export Agent (Two-Pass for Perfect Schema)
-' Target: Domino R5+ Compatibility
-' Features: 
-'  - Two-Pass: 1. Scan for Schema (Union of Fields), 2. Export Data
-'  - Guarantees 100% Header Accuracy & Column Alignment
-'  - Handles RichText & Attachments
+' Domino Data Export - Ultra-Fast Single-Pass (Data Preservation Mode)
 ' ********************************************************************************
 
 Option Public
 Option Explicit
 
 ' --- CONFIGURATION ---
-Const EXPORT_ALL_DATA = True    ' False to limit to SAMPLE_LIMIT docs per form 
-Const SAMPLE_LIMIT = 10         ' Number of docs to scan AND export in test mode
-Const FULL_MODE_SCAN_LIMIT = 50 ' Only used when EXPORT_ALL_DATA=True (0 for perfect accuracy)
+Const EXPORT_ALL_DATA = True    ' False for testing (SAMPLE_LIMIT), True for full export
+Const SAMPLE_LIMIT = 100        ' Max docs per form in test mode
 Const SKIP_ATTACHMENTS = True   ' Set to True to skip attachment extraction for speed
 Const EXPORT_BASE_DIR = "C:\temp\domino_export\"
 ' ********************************************************************************
 
 ' Global Schema Storage: List of Strings (Form -> "Field1,Field2,Field3")
 Dim g_Schemas List As String 
+' File Handle Storage: List of Integers (Form -> FileNumber)
+Dim g_FileHandles List As Integer
+' Document Counters (Form -> Count)
+Dim g_DocCounters List As Long
 
 Sub Initialize
     Dim session As New NotesSession
     Dim db As NotesDatabase
-    Dim processedForms List As Integer
-    Dim orphanQuery As String
-    Dim formCount As Integer
+    Dim dc As NotesDocumentCollection
+    Dim doc As NotesDocument
+    Dim nextDoc As NotesDocument
+    Dim processed As Long
     
     Set db = session.CurrentDatabase
     
-    ' Ensure base dirs (idempotent)
+    ' Ensure base dirs 
     On Error Resume Next
     Mkdir "C:\temp"
     Mkdir EXPORT_BASE_DIR
     If Not SKIP_ATTACHMENTS Then Mkdir EXPORT_BASE_DIR & "Attachments"
     On Error Goto 0
     
-    Print "PHASE 1: Exporting Known Forms..."
+    ' 1. Pre-load Headers from Design (Seconds)
+    Print "Pre-loading Form Design Headers..."
+    Call LoadDesignSchemas(db)
     
-    orphanQuery = ""
-    formCount = 0
-    ' Iterate through all forms in the database
-    Forall formObj In db.Forms
-        Dim fName As String
-        fName = formObj.Name
-        If fName <> "" Then
-            processedForms(fName) = 1
-            Call ProcessForm(db, fName)
-            
-            ' Build orphan query carefully (Domino query length limit is approx 512-1024 chars in Search)
-            If Len(orphanQuery) < 800 Then 
-                If orphanQuery <> "" Then orphanQuery = orphanQuery & " & "
-                orphanQuery = orphanQuery & "Form != """ & fName & """"
-            End If
-            formCount = formCount + 1
-        End If
-    End Forall
+    ' 2. Single Pass Export (Fastest)
+    Print "Starting Single-Pass Export..."
     
-    Print "PHASE 2: Checking for Orphaned Data..."
-    ' If the database has documents with NO Form field, orphanQuery will catch them too
-    If orphanQuery = "" Then orphanQuery = "@All" ' Should not happen if forms exist
-    
-    Call ProcessOrphanedDocs(db, orphanQuery)
-    
-    Msgbox "Export Finished! Checked " & formCount & " forms." & Chr(10) & "Location: " & EXPORT_BASE_DIR
-End Sub
-
-' ********************************************************************************
-' Optimized Form-by-Form Processor
-' ********************************************************************************
-Sub ProcessForm(db As NotesDatabase, formName As String)
-    Dim dc As NotesDocumentCollection
-    Dim doc As NotesDocument
-    Dim query As String
-    Dim schemaStr As String
-    Dim fileNum As Integer
-    Dim csvPath As String
-    Dim count As Long
-    
-    ' 1. BUILD SCHEMA 
-    Dim scanLimit As Integer
-    If EXPORT_ALL_DATA Then
-        scanLimit = FULL_MODE_SCAN_LIMIT
-    Else
-        scanLimit = SAMPLE_LIMIT
-    End If
-    
-    ' Use @LowerCase for query to handle case-mismatch in R5/R6
-    query = "@LowerCase(Form) = """ & Lcase(formName) & """"
-    Set dc = db.Search(query, Nothing, scanLimit) 
-    
-    ' Fallback to simple query if complex one returns 0 (LotusScript quirks)
-    If dc.Count = 0 Then
-        query = "Form = """ & formName & """"
-        Set dc = db.Search(query, Nothing, scanLimit)
-    End If
-    
-    If dc.Count = 0 Then Exit Sub 
-    
-    Print "Processing Form: " & formName & " (Scanning Schema...)"
-    schemaStr = "UNID|Created|Attachments"
+    ' CRITICAL: Get document collection ONCE to avoid re-indexing slowness
+    Set dc = db.AllDocuments
     Set doc = dc.GetFirstDocument
+    processed = 0
+    
     While Not (doc Is Nothing)
-        Call UpdateSchema(doc, schemaStr)
-        Set doc = dc.GetNextDocument(doc)
-    Wend
-    g_Schemas(formName) = schemaStr
-    
-    ' 2. PREPARE CSV & WRITE HEADER
-    csvPath = EXPORT_BASE_DIR & "data_" & formName & ".csv"
-    fileNum = FreeFile
-    Open csvPath For Output As #fileNum
-    Call WriteHeaderToFile(fileNum, schemaStr)
-    
-    ' 3. EXPORT DATA
-    Print "Processing Form: " & formName & " (Exporting Data...)"
-    ' Re-execute search without document limit if EXPORT_ALL_DATA
-    If EXPORT_ALL_DATA Then
-        Set dc = db.Search(query, Nothing, 0)
-    Else
-        ' In sample mode, we already have the collection from Build Schema step
-    End If
-    
-    count = 0
-    Set doc = dc.GetFirstDocument
-    While Not (doc Is Nothing)
-        Call ExportRowToFile(fileNum, doc, schemaStr, formName)
-        count = count + 1
-        If count Mod 100 = 0 Then Print "  Form '" & formName & "': " & count & " docs..."
-        Set doc = dc.GetNextDocument(doc)
-    Wend
-    
-    Close #fileNum
-    Print "Finished Form: " & formName & " (" & count & " docs exported)"
-End Sub
-
-Sub ProcessOrphanedDocs(db As NotesDatabase, query As String)
-    Dim dc As NotesDocumentCollection
-    Dim doc As NotesDocument
-    Dim schemaStr As String
-    Dim fileNum As Integer
-    Dim csvPath As String
-    Dim count As Long
-    
-    ' 1. BUILD SCHEMA (Use a separate scan of first few docs)
-    Dim scanLimit As Integer
-    If EXPORT_ALL_DATA Then
-        scanLimit = FULL_MODE_SCAN_LIMIT
-        If scanLimit = 0 Then scanLimit = 50 
-    Else
-        scanLimit = SAMPLE_LIMIT
-    End If
-    
-    ' We use Search with 0 to get the full collection, then manually limit scan
-    Set dc = db.Search(query, Nothing, 0) 
-    If dc.Count = 0 Then Exit Sub
-    
-    Print "Processing Orphaned Docs (Scanning Schema...)"
-    schemaStr = "UNID|Created|Attachments"
-    Set doc = dc.GetFirstDocument
-    count = 0
-    While Not (doc Is Nothing) And (count < scanLimit)
-        Call UpdateSchema(doc, schemaStr)
-        Set doc = dc.GetNextDocument(doc)
-        count = count + 1
-    Wend
-    
-    csvPath = EXPORT_BASE_DIR & "data_OrphanedDocs.csv"
-    fileNum = FreeFile
-    Open csvPath For Output As #fileNum
-    Call WriteHeaderToFile(fileNum, schemaStr)
-    
-    Print "Processing Orphaned Docs (Exporting Data...)"
-    count = 0
-    Set doc = dc.GetFirstDocument
-    Do While Not (doc Is Nothing)
-        Call ExportRowToFile(fileNum, doc, schemaStr, "Orphaned")
-        count = count + 1
-        If count Mod 100 = 0 Then Print "  Orphaned: " & count & " docs..."
-        Set doc = dc.GetNextDocument(doc)
+        ' Get next document BEFORE processing current (best practice for large collections)
+        ' Note: In very large DBs, using dc.GetNextDocument(doc) is safer than 
+        ' relying on the collection object repeatedly inside the loop.
+        Set nextDoc = dc.GetNextDocument(doc)
         
-        ' Respect SAMPLE_LIMIT even for orphaned docs if test mode
-        If Not EXPORT_ALL_DATA Then
-            If count >= SAMPLE_LIMIT Then Exit Do
-        End If
-    Loop
+        Call ProcessDocument(doc)
+        
+        processed = processed + 1
+        If processed Mod 500 = 0 Then Print "Export Progress: " & processed & " docs..."
+        
+        ' Manual Recycle (LotusScript Garbage Collection support)
+        Set doc = Nothing
+        Set doc = nextDoc
+    Wend
     
-    Close #fileNum
-    Print "Finished Orphaned Docs (" & count & " docs exported)"
+    ' Cleanup
+    Call CloseAllFiles()
+    
+    Msgbox "Export Finished! Total docs: " & processed & Chr(10) & "Location: " & EXPORT_BASE_DIR
 End Sub
 
-Sub UpdateSchema(doc As NotesDocument, schemaStr As String)
+' ********************************************************************************
+' Load schemas from Design Forms
+' ********************************************************************************
+Sub LoadDesignSchemas(db As NotesDatabase)
+    Dim fName As String
+    Dim s As String
+    Forall formObj In db.Forms
+        fName = formObj.Name
+        ' Build initial header from design fields
+        s = "UNID|Created|Attachments|Form"
+        Forall fieldname In formObj.Fields
+            If Instr(1, "|" & s & "|", "|" & fieldname & "|", 5) = 0 Then
+                s = s & "|" & fieldname
+            End If
+        End Forall
+        s = s & "|__ExtraFields" ' The Overflow Column
+        g_Schemas(fName) = s
+    End Forall
+End Sub
+
+' ********************************************************************************
+' Core Document Processor
+' ********************************************************************************
+Sub ProcessDocument(doc As NotesDocument)
+    Dim formName As String
+    Dim schemaStr As String
+    Dim fileNum As Integer
+    
+    formName = doc.GetItemValue("Form")(0)
+    If formName = "" Then formName = "UnknownForm"
+    
+    ' Respect sample limit if needed
+    If Not EXPORT_ALL_DATA Then
+        If Not IsElement(g_DocCounters(formName)) Then g_DocCounters(formName) = 0
+        If g_DocCounters(formName) >= SAMPLE_LIMIT Then Exit Sub
+    End If
+    
+    ' Lazy File Opening
+    If Not IsElement(g_FileHandles(formName)) Then
+        ' If we didn't find the form in design (Orphaned scenario)
+        If Not IsElement(g_Schemas(formName)) Then
+            schemaStr = "UNID|Created|Attachments|Form"
+            Call UpdateSchemaFromDoc(doc, schemaStr)
+            schemaStr = schemaStr & "|__ExtraFields"
+            g_Schemas(formName) = schemaStr
+        End If
+        Call CreateCsvWithHeader(formName, g_Schemas(formName))
+    End If
+    
+    fileNum = g_FileHandles(formName)
+    schemaStr = g_Schemas(formName)
+    
+    ' Export the Row
+    Call ExportRowToFile(fileNum, doc, schemaStr, formName)
+    
+    ' Increment Counter
+    If Not IsElement(g_DocCounters(formName)) Then g_DocCounters(formName) = 0
+    g_DocCounters(formName) = g_DocCounters(formName) + 1
+End Sub
+
+Sub UpdateSchemaFromDoc(doc As NotesDocument, schemaStr As String)
     Dim items As Variant
     Dim i As Integer
-    Dim iName As String
     items = doc.Items
     If IsArray(items) Then
         For i = 0 To Ubound(items)
             If Not (items(i) Is Nothing) Then
-                iName = items(i).Name
-                If Instr(1, "|" & schemaStr & "|", "|" & iName & "|", 5) = 0 Then
-                    schemaStr = schemaStr & "|" & iName
+                If Instr(1, "|" & schemaStr & "|", "|" & items(i).Name & "|", 5) = 0 Then
+                    schemaStr = schemaStr & "|" & items(i).Name
                 End If
             End If
         Next
     End If
 End Sub
 
-Sub WriteHeaderToFile(fileNum As Integer, schemaStr As String)
+Sub CreateCsvWithHeader(form As String, schemaStr As String)
+    Dim fileNum As Integer
+    Dim csvPath As String
+    Dim safeForm As String
+    
+    ' Sanitize filename
+    safeForm = R5Substitute(form, "/", "_")
+    safeForm = R5Substitute(safeForm, "\", "_")
+    
+    csvPath = EXPORT_BASE_DIR & "data_" & safeForm & ".csv"
+    fileNum = FreeFile
+    Open csvPath For Output As #fileNum
+    
     Dim headers As Variant
     Dim csvLine As String
     Dim i As Integer
@@ -219,6 +168,7 @@ Sub WriteHeaderToFile(fileNum As Integer, schemaStr As String)
         csvLine = csvLine & EncloseQuotes(Cstr(headers(i)))
     Next
     Print #fileNum, csvLine
+    g_FileHandles(form) = fileNum
 End Sub
 
 Sub ExportRowToFile(fileNum As Integer, doc As NotesDocument, schemaStr As String, form As String)
@@ -228,36 +178,70 @@ Sub ExportRowToFile(fileNum As Integer, doc As NotesDocument, schemaStr As Strin
     Dim fName As String
     Dim valStr As String
     Dim item As NotesItem
+    Dim extraData As String
+    Dim checkedFields List As Integer
     
     fields = Explode(schemaStr, "|")
     csvLine = ""
+    extraData = ""
+    
+    ' 1. Export Standard Fields
     For i = 0 To Ubound(fields)
         fName = Cstr(fields(i))
+        checkedFields(fName) = 1
         valStr = ""
+        
         If fName = "UNID" Then
             valStr = doc.UniversalID
         Elseif fName = "Created" Then
             valStr = Cstr(doc.Created)
         Elseif fName = "Attachments" Then
             valStr = HandleAttachments(doc, form)
+        Elseif fName = "Form" Then
+            valStr = form
+        Elseif fName = "__ExtraFields" Then
+            ' Handled after the loop
+            valStr = "[PENDING]"
         Else
             Set item = doc.GetFirstItem(fName)
             If Not (item Is Nothing) Then
                 valStr = GetItemValueStr(doc, item)
             End If
         End If
+        
         If i > 0 Then csvLine = csvLine & ","
         csvLine = csvLine & EncloseQuotes(valStr)
     Next
+    
+    ' 2. Capture Overflow (Extra Fields not in Header)
+    Dim allItems As Variant
+    allItems = doc.Items
+    If IsArray(allItems) Then
+        For i = 0 To Ubound(allItems)
+            If Not (allItems(i) Is Nothing) Then
+                If Not IsElement(checkedFields(allItems(i).Name)) Then
+                    extraData = extraData & allItems(i).Name & ": " & GetItemValueStr(doc, allItems(i)) & "; "
+                End If
+            End If
+        Next
+    End If
+    
+    ' Finalize row by replacing [PENDING] with actual extraData
+    csvLine = R5Substitute(csvLine, EncloseQuotes("[PENDING]"), EncloseQuotes(extraData))
+    
     Print #fileNum, csvLine
 End Sub
 
-
+Sub CloseAllFiles()
+    Forall h In g_FileHandles
+        Close #h
+    End Forall
+    Erase g_FileHandles
+End Sub
 
 Function GetItemValueStr(doc As NotesDocument, item As NotesItem) As String
     Dim valStr As String
-    
-    If item.Type = RICHTEXT Then
+    If item.Type = 1 Then ' RICHTEXT
         On Error Resume Next
         valStr = doc.Abstract(2000, False, False, item.Name)
         If Err <> 0 Then valStr = "[Complex RTF]"
@@ -273,105 +257,54 @@ Function GetItemValueStr(doc As NotesDocument, item As NotesItem) As String
         End If
         valStr = R5CleanupText(valStr)
     End If
-    
     GetItemValueStr = valStr
 End Function
-
-
-' --------------------------------------------------------------------------------
-' HELPER FUNCTIONS
-' --------------------------------------------------------------------------------
 
 Function HandleAttachments(doc As NotesDocument, form As String) As String
     Dim obj As NotesEmbeddedObject
     Dim path As String
     Dim outPaths As String
     Dim subDir As String
-    
     Dim hasCreatedDir As Integer
-    hasCreatedDir = False
-    
-    outPaths = ""
     
     If SKIP_ATTACHMENTS Then
-        HandleAttachments = "[Skipped Attachments]"
+        HandleAttachments = "[Skipped]"
         Exit Function
     End If
     
+    hasCreatedDir = False
+    outPaths = ""
     subDir = EXPORT_BASE_DIR & "Attachments\" & form & "\" & doc.UniversalID & "\"
     
-    ' Lazy creation: Removed early Mkdir calls
-    
-    ' Check for all attachments (V2 and RichText embedded)
     If doc.HasEmbedded Then
         Dim embObjs As Variant
         embObjs = doc.EmbeddedObjects
-        Dim oIdx As Integer
-        For oIdx = 0 To Ubound(embObjs)
-            Set obj = embObjs(oIdx)
-            If obj.Type = EMBED_ATTACHMENT Then
-                If Not hasCreatedDir Then
-                    On Error Resume Next
-                    Mkdir EXPORT_BASE_DIR & "Attachments\" & form
-                    Mkdir subDir
-                    On Error Goto 0
-                    hasCreatedDir = True
-                End If
-            
-                path = subDir & obj.Source
-                Call obj.ExtractFile(path)
-                outPaths = outPaths & obj.Source & " (" & path & "); "
-            End If
-        Next
-    End If
-    
-    ' RichText specific check
-    Dim docItems As Variant
-    If IsArray(doc.Items) Then
-        docItems = doc.Items
-        Dim itmIdx As Integer
-        For itmIdx = 0 To Ubound(docItems)
-            Dim currentItm As NotesItem
-            If Not (docItems(itmIdx) Is Nothing) Then
-                Set currentItm = docItems(itmIdx)
-                If currentItm.Type = RICHTEXT Then
-                    Dim rt As Variant
-                    Set rt = currentItm
-                    Dim rtObjs As Variant
-                    rtObjs = rt.EmbeddedObjects
-                    If Not IsEmpty(rtObjs) Then
-                        Dim objIdx As Integer
-                        For objIdx = 0 To Ubound(rtObjs)
-                            Set obj = rtObjs(objIdx)
-                            If obj.Type = EMBED_ATTACHMENT Then
-                                If Not hasCreatedDir Then
-                                    On Error Resume Next
-                                    Mkdir EXPORT_BASE_DIR & "Attachments\" & form
-                                    Mkdir subDir
-                                    On Error Goto 0
-                                    hasCreatedDir = True
-                                End If
-                            
-                                path = subDir & obj.Source
-                                Call obj.ExtractFile(path)
-                                outPaths = outPaths & obj.Source & " (" & path & "); "
-                            End If
-                        Next
+        If Not IsEmpty(embObjs) Then
+            Dim oIdx As Integer
+            For oIdx = 0 To Ubound(embObjs)
+                Set obj = embObjs(oIdx)
+                If obj.Type = 1080 Then ' EMBED_ATTACHMENT
+                    If Not hasCreatedDir Then
+                        On Error Resume Next
+                        Mkdir EXPORT_BASE_DIR & "Attachments\" & form
+                        Mkdir subDir
+                        On Error Goto 0
+                        hasCreatedDir = True
                     End If
+                    path = subDir & obj.Source
+                    Call obj.ExtractFile(path)
+                    outPaths = outPaths & obj.Source & "; "
                 End If
-            End If
-        Next
+            Next
+        End If
     End If
-    
     HandleAttachments = outPaths
 End Function
 
 Function EncloseQuotes(txt As String) As String
     Dim tmp As String
     tmp = txt
-    ' Double up internal quotes
     tmp = R5Substitute(tmp, """", """""")
-    ' Wrap in quotes
     EncloseQuotes = """" & tmp & """"
 End Function
 
@@ -406,11 +339,9 @@ Function R5CleanupText(txt As String) As String
 End Function
 
 Function Explode(Byval s As String, separator As String) As Variant
-    ' Custom Split function for R5
     Dim result() As String
     Dim n As Integer
     Dim p As Long
-    
     n = 0
     p = Instr(s, separator)
     While p > 0
@@ -420,9 +351,7 @@ Function Explode(Byval s As String, separator As String) As Variant
         n = n + 1
         p = Instr(s, separator)
     Wend
-    
     Redim Preserve result(n)
     result(n) = s
-    
     Explode = result
 End Function
