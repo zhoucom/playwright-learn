@@ -271,6 +271,9 @@ Sub WriteHeader(form As String, schemaStr As String)
     
     Print #fileNum, csvLine
     Close #fileNum
+    
+    ' Give OS time to release file lock
+    Yield
 End Sub
 
 Sub ExportRow(doc As NotesDocument, form As String)
@@ -291,7 +294,19 @@ Sub ExportRow(doc As NotesDocument, form As String)
     fileNum = FreeFile
     
     ' Append Data
+    On Error Resume Next
     Open csvPath For Append As #fileNum
+    If Err <> 0 Then
+        ' Retry once after a short pause
+        Err = 0
+        Yield
+        Open csvPath For Append As #fileNum
+        If Err <> 0 Then
+            Print "ERROR: Could not open file for append: " & csvPath & " (" & Error$ & ")"
+            Exit Sub
+        End If
+    End If
+    On Error Goto 0
     
     fields = Explode(schemaStr, "|")
     csvLine = ""
@@ -321,6 +336,7 @@ Sub ExportRow(doc As NotesDocument, form As String)
     
     Print #fileNum, csvLine
     Close #fileNum
+    Yield
 End Sub
 
 Function GetItemValueStr(doc As NotesDocument, item As NotesItem) As String
