@@ -293,19 +293,31 @@ Sub ExportRow(doc As NotesDocument, form As String)
     csvPath = EXPORT_BASE_DIR & "data_" & form & ".csv"
     fileNum = FreeFile
     
-    ' Append Data
+    ' Append Data - Robust Retry Loop
+    Dim retryCount As Integer
+    Dim k As Long
+    
+    retryCount = 0
+    
     On Error Resume Next
-    Open csvPath For Append As #fileNum
-    If Err <> 0 Then
-        ' Retry once after a short pause
+    Do
         Err = 0
-        Yield
         Open csvPath For Append As #fileNum
-        If Err <> 0 Then
-            Print "ERROR: Could not open file for append: " & csvPath & " (" & Error$ & ")"
+        
+        If Err = 0 Then Exit Do ' Success
+        
+        retryCount = retryCount + 1
+        If retryCount > 10 Then
+            Print "ERROR: Failed to open file after 10 retries: " & csvPath & " (" & Error$ & ")"
             Exit Sub
         End If
-    End If
+        
+        ' Busy wait delay (approx 100ms - 500ms depending on CPU)
+        For k = 0 To 200000 
+            ' Just counting time
+        Next 
+        Yield
+    Loop
     On Error Goto 0
     
     fields = Explode(schemaStr, "|")
