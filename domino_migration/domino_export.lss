@@ -13,7 +13,6 @@ Option Explicit
 ' --- CONFIGURATION ---
 Const EXPORT_ALL_DATA = True ' False to limit to SAMPLE_LIMIT docs per form (for testing)
 Const SAMPLE_LIMIT = 100
-Const USE_DESIGN_SCHEMA = True ' True to read Form Design (Fastest), False to scan Data (Most Accurate but Slow)
 Const EXPORT_BASE_DIR = "C:\temp\domino_export\"
 ' ********************************************************************************
 
@@ -28,10 +27,8 @@ Sub Initialize
     
     Set db = session.CurrentDatabase
     
-    If USE_DESIGN_SCHEMA Then
-        Print "PHASE 1: Scanning Schema - DESIGN MODE (Reading Form Definitions)"
-    Elseif EXPORT_ALL_DATA Then
-        Print "PHASE 1: Scanning Schema (Building Headers) - FULL DATA SCAN MODE"
+    If EXPORT_ALL_DATA Then
+        Print "PHASE 1: Scanning Schema (Building Headers) - FULL SCAN MODE"
     Else
         Print "PHASE 1: Scanning Schema (Building Headers) - SAMPLE MODE (Limit: " & SAMPLE_LIMIT & ")"
     End If
@@ -68,49 +65,6 @@ Sub BuildSchemas(db As NotesDatabase)
     
     ' Reset global counters for schema pass
     Erase g_Counters
-
-    ' ---------------------------------------------------------
-    ' MODE A: DESIGN SCAN (Fast, relies on Form Design)
-    ' ---------------------------------------------------------
-    If USE_DESIGN_SCHEMA Then
-        Dim forms As Variant
-        Dim f As NotesForm
-        Dim fIdx As Integer
-        
-        forms = db.Forms
-        Print "BuildSchemas: Found " & Ubound(forms) + 1 & " forms in design."
-        
-        For fIdx = 0 To Ubound(forms)
-            Set f = forms(fIdx)
-            Print "BuildSchemas: Processing Form Design '" & f.Name & "'..."
-            
-            ' Base Fields
-            existingFields = "UNID|Created|Attachments" 
-            
-            ' Add Form Fields
-            ' Note: NotesForm.Fields returns a String array of field names
-            If IsArray(f.Fields) Then
-                For i = 0 To Ubound(f.Fields)
-                    Dim fldName As String
-                    fldName = f.Fields(i)
-                    ' Simple dup check
-                    If Instr(1, "|" & existingFields & "|", "|" & fldName & "|", 5) = 0 Then
-                        existingFields = existingFields & "|" & fldName
-                    End If
-                Next
-            End If
-            
-            g_Schemas(f.Name) = existingFields
-            Print "BuildSchemas: Schema for '" & f.Name & "' built with " & (UBound(Explode(existingFields, "|")) + 1) & " fields."
-        Next
-        
-        Print "Schema Scan (Design Mode) Complete."
-        Exit Sub
-    End If
-    
-    ' ---------------------------------------------------------
-    ' MODE B: DATA SCAN (Slow, scans actual documents)
-    ' ---------------------------------------------------------
     
     While Not (doc Is Nothing)
         Set nextDoc = dc.GetNextDocument(doc)
@@ -271,9 +225,6 @@ Sub WriteHeader(form As String, schemaStr As String)
     
     Print #fileNum, csvLine
     Close #fileNum
-    
-    ' Give OS time to release file lock
-    Yield
 End Sub
 
 Sub ExportRow(doc As NotesDocument, form As String)
@@ -293,32 +244,8 @@ Sub ExportRow(doc As NotesDocument, form As String)
     csvPath = EXPORT_BASE_DIR & "data_" & form & ".csv"
     fileNum = FreeFile
     
-    ' Append Data - Robust Retry Loop
-    Dim retryCount As Integer
-    Dim k As Long
-    
-    retryCount = 0
-    
-    On Error Resume Next
-    Do
-        Err = 0
-        Open csvPath For Append As #fileNum
-        
-        If Err = 0 Then Exit Do ' Success
-        
-        retryCount = retryCount + 1
-        If retryCount > 10 Then
-            Print "ERROR: Failed to open file after 10 retries: " & csvPath & " (" & Error$ & ")"
-            Exit Sub
-        End If
-        
-        ' Busy wait delay (approx 100ms - 500ms depending on CPU)
-        For k = 0 To 200000 
-            ' Just counting time
-        Next 
-        Yield
-    Loop
-    On Error Goto 0
+    ' Append Data
+    Open csvPath For Append As #fileNum
     
     fields = Explode(schemaStr, "|")
     csvLine = ""
@@ -348,7 +275,6 @@ Sub ExportRow(doc As NotesDocument, form As String)
     
     Print #fileNum, csvLine
     Close #fileNum
-    Yield
 End Sub
 
 Function GetItemValueStr(doc As NotesDocument, item As NotesItem) As String
