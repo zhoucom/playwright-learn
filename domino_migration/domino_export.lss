@@ -11,7 +11,9 @@ Option Public
 Option Explicit
 
 ' --- CONFIGURATION ---
-Const EXPORT_ALL_DATA = True ' False to limit to 100 docs per form (for testing)
+Const EXPORT_ALL_DATA = True ' False to limit to SAMPLE_LIMIT docs per form (for testing)
+Const SAMPLE_LIMIT = 100
+Const USE_DESIGN_SCHEMA = True ' True to read Form Design (Fastest), False to scan Data (Most Accurate but Slow)
 Const EXPORT_BASE_DIR = "C:\temp\domino_export\"
 ' ********************************************************************************
 
@@ -26,10 +28,20 @@ Sub Initialize
     
     Set db = session.CurrentDatabase
     
-    Print "PHASE 1: Scanning Schema (Building Headers)..."
+    If USE_DESIGN_SCHEMA Then
+        Print "PHASE 1: Scanning Schema - DESIGN MODE (Reading Form Definitions)"
+    Elseif EXPORT_ALL_DATA Then
+        Print "PHASE 1: Scanning Schema (Building Headers) - FULL DATA SCAN MODE"
+    Else
+        Print "PHASE 1: Scanning Schema (Building Headers) - SAMPLE MODE (Limit: " & SAMPLE_LIMIT & ")"
+    End If
     Call BuildSchemas(db)
     
-    Print "PHASE 2: Write Headers & Export Data..."
+    If EXPORT_ALL_DATA Then
+        Print "PHASE 2: Write Headers & Export Data - FULL SCAN MODE"
+    Else
+        Print "PHASE 2: Write Headers & Export Data - SAMPLE MODE (Limit: " & SAMPLE_LIMIT & ")"
+    End If
     Call ExportData(db)
     
     Msgbox "Two-Pass Export Finished!" & Chr(10) & "Location: " & EXPORT_BASE_DIR
@@ -56,6 +68,49 @@ Sub BuildSchemas(db As NotesDatabase)
     
     ' Reset global counters for schema pass
     Erase g_Counters
+
+    ' ---------------------------------------------------------
+    ' MODE A: DESIGN SCAN (Fast, relies on Form Design)
+    ' ---------------------------------------------------------
+    If USE_DESIGN_SCHEMA Then
+        Dim forms As Variant
+        Dim f As NotesForm
+        Dim fIdx As Integer
+        
+        forms = db.Forms
+        Print "BuildSchemas: Found " & Ubound(forms) + 1 & " forms in design."
+        
+        For fIdx = 0 To Ubound(forms)
+            Set f = forms(fIdx)
+            Print "BuildSchemas: Processing Form Design '" & f.Name & "'..."
+            
+            ' Base Fields
+            existingFields = "UNID|Created|Attachments" 
+            
+            ' Add Form Fields
+            ' Note: NotesForm.Fields returns a String array of field names
+            If IsArray(f.Fields) Then
+                For i = 0 To Ubound(f.Fields)
+                    Dim fldName As String
+                    fldName = f.Fields(i)
+                    ' Simple dup check
+                    If Instr(1, "|" & existingFields & "|", "|" & fldName & "|", 5) = 0 Then
+                        existingFields = existingFields & "|" & fldName
+                    End If
+                Next
+            End If
+            
+            g_Schemas(f.Name) = existingFields
+            Print "BuildSchemas: Schema for '" & f.Name & "' built with " & (UBound(Explode(existingFields, "|")) + 1) & " fields."
+        Next
+        
+        Print "Schema Scan (Design Mode) Complete."
+        Exit Sub
+    End If
+    
+    ' ---------------------------------------------------------
+    ' MODE B: DATA SCAN (Slow, scans actual documents)
+    ' ---------------------------------------------------------
     
     While Not (doc Is Nothing)
         Set nextDoc = dc.GetNextDocument(doc)
@@ -70,7 +125,10 @@ Sub BuildSchemas(db As NotesDatabase)
         
         If Not EXPORT_ALL_DATA Then
             If IsElement(g_Counters(formName)) Then
-                If g_Counters(formName) >= 100 Then skip = True
+                If g_Counters(formName) >= SAMPLE_LIMIT Then 
+                    skip = True
+                    If g_Counters(formName) = SAMPLE_LIMIT Then Print "BuildSchemas: Limit of " & SAMPLE_LIMIT & " reached for form '" & formName & "'. Skipping remaining docs for schema build."
+                End If
             End If
         End If
         
@@ -163,7 +221,10 @@ Sub ExportData(db As NotesDatabase)
         
         If Not EXPORT_ALL_DATA Then
             If IsElement(g_Counters(formName)) Then
-                If g_Counters(formName) >= 100 Then skip = True
+                If g_Counters(formName) >= SAMPLE_LIMIT Then 
+                    skip = True
+                    If g_Counters(formName) = SAMPLE_LIMIT Then Print "ExportData: Limit of " & SAMPLE_LIMIT & " reached for form '" & formName & "'. Skipping remaining docs."
+                End If
             End If
         End If
         
@@ -296,13 +357,13 @@ Function HandleAttachments(doc As NotesDocument, form As String) As String
     Dim outPaths As String
     Dim subDir As String
     
+    Dim hasCreatedDir As Integer
+    hasCreatedDir = False
+    
     outPaths = ""
     subDir = EXPORT_BASE_DIR & "Attachments\" & form & "\" & doc.UniversalID & "\"
     
-    On Error Resume Next
-    Mkdir EXPORT_BASE_DIR & "Attachments\" & form
-    Mkdir subDir
-    On Error Goto 0
+    ' Lazy creation: Removed early Mkdir calls
     
     ' Check for all attachments (V2 and RichText embedded)
     If doc.HasEmbedded Then
@@ -312,6 +373,14 @@ Function HandleAttachments(doc As NotesDocument, form As String) As String
         For oIdx = 0 To Ubound(embObjs)
             Set obj = embObjs(oIdx)
             If obj.Type = EMBED_ATTACHMENT Then
+                If Not hasCreatedDir Then
+                    On Error Resume Next
+                    Mkdir EXPORT_BASE_DIR & "Attachments\" & form
+                    Mkdir subDir
+                    On Error Goto 0
+                    hasCreatedDir = True
+                End If
+            
                 path = subDir & obj.Source
                 Call obj.ExtractFile(path)
                 outPaths = outPaths & obj.Source & " (" & path & "); "
@@ -338,6 +407,14 @@ Function HandleAttachments(doc As NotesDocument, form As String) As String
                         For objIdx = 0 To Ubound(rtObjs)
                             Set obj = rtObjs(objIdx)
                             If obj.Type = EMBED_ATTACHMENT Then
+                                If Not hasCreatedDir Then
+                                    On Error Resume Next
+                                    Mkdir EXPORT_BASE_DIR & "Attachments\" & form
+                                    Mkdir subDir
+                                    On Error Goto 0
+                                    hasCreatedDir = True
+                                End If
+                            
                                 path = subDir & obj.Source
                                 Call obj.ExtractFile(path)
                                 outPaths = outPaths & obj.Source & " (" & path & "); "
